@@ -114,7 +114,27 @@ def run_rules(cu: pd.DataFrame, leases: pd.DataFrame, emp: pd.DataFrame, sites: 
 
     # Employees
     if not emp.empty:
-        ensure_cols(emp, ["cons_unit", "cons_unit_name", "admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"], "employees")
+# Required minimal columns for employees
+ensure_cols(emp, ["cons_unit"], "employees")
+
+# Normalize optional names / aliases
+emp = emp.copy()
+
+# cons_unit_name optional: derive if missing
+if "cons_unit_name" not in emp.columns:
+    if "unit_name" in emp.columns:
+        emp["cons_unit_name"] = emp["unit_name"]
+    else:
+        emp["cons_unit_name"] = ""
+
+# R&D column: accept either rd_FTEs or r_and_d_FTEs
+if "r_and_d_FTEs" not in emp.columns and "rd_FTEs" in emp.columns:
+    emp["r_and_d_FTEs"] = emp["rd_FTEs"]
+
+# If still missing, create as 0
+for col in ["admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"]:
+    if col not in emp.columns:
+        emp[col] = 0
         fte_cols = ["admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"]
         for c in fte_cols:
             emp[c] = pd.to_numeric(emp[c], errors="coerce").fillna(0)
