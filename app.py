@@ -1,12 +1,12 @@
 import os
 import json
 import tempfile
+import hashlib
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 from passlib.hash import bcrypt
-from sqlalchemy import text
 
 from db import get_engine, exec_sql, fetch_all, fetch_one
 from maptrix_engine import (
@@ -20,7 +20,6 @@ ENGINE = get_engine()
 
 # ---------- Bootstrap schema (for SQLite dev; for Postgres you can run schema.sql once) ----------
 def bootstrap_sqlite():
-    # Minimal subset for SQLite dev. For Postgres: run schema.sql.
     exec_sql(ENGINE, """
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,25 +89,30 @@ def bootstrap_sqlite():
 
 bootstrap_sqlite()
 
-
-# ---------- Auth ----------
+# ---------- Auth (FIXED) ----------
 def get_user_by_email(email: str):
     return fetch_one(ENGINE, "SELECT * FROM users WHERE email=:e", {"e": email})
 
+def _pw_for_bcrypt(password: str) -> str:
+    """
+    bcrypt has a 72-byte input limit. To avoid errors + unicode issues,
+    we pre-hash with sha256 (always 64 hex chars), then bcrypt that.
+    """
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
 def create_user(email: str, password: str):
-    password = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-    ph = bcrypt.hash(password)
-    exec_sql(ENGINE, "INSERT INTO users(email,password_hash,created_at) VALUES(:e,:p,:t)",
-             {"e": email, "p": ph, "t": datetime.utcnow().isoformat()})
+    ph = bcrypt.hash(_pw_for_bcrypt(password))
+    exec_sql(
+        ENGINE,
+        "INSERT INTO users(email,password_hash,created_at) VALUES(:e,:p,:t)",
+        {"e": email, "p": ph, "t": datetime.utcnow().isoformat()},
+    )
 
 def verify_user(email: str, password: str):
     u = get_user_by_email(email)
     if not u:
         return None
-
-    password = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-
-    if bcrypt.verify(password, u["password_hash"]):
+    if bcrypt.verify(_pw_for_bcrypt(password), u["password_hash"]):
         return u
     return None
 
@@ -149,20 +153,29 @@ def require_login():
 user = require_login()
 user_id = user["id"]
 
-
 # ---------- Mapping memory ----------
 def load_mappings(user_id: int) -> dict:
-    rows = fetch_all(ENGINE, "SELECT from_cons_unit, to_cons_unit FROM cons_unit_mappings WHERE user_id=:u", {"u": user_id})
+    rows = fetch_all(
+        ENGINE,
+        "SELECT from_cons_unit, to_cons_unit FROM cons_unit_mappings WHERE user_id=:u",
+        {"u": user_id},
+    )
     return {r["from_cons_unit"]: r["to_cons_unit"] for r in rows}
 
 def upsert_mapping(user_id: int, from_cu: str, to_cu: str, note: str = ""):
-    # SQLite UPSERT syntax differs; do a simple delete+insert for MVP portability.
-    exec_sql(ENGINE, "DELETE FROM cons_unit_mappings WHERE user_id=:u AND from_cons_unit=:f", {"u": user_id, "f": from_cu})
-    exec_sql(ENGINE, """
+    exec_sql(
+        ENGINE,
+        "DELETE FROM cons_unit_mappings WHERE user_id=:u AND from_cons_unit=:f",
+        {"u": user_id, "f": from_cu},
+    )
+    exec_sql(
+        ENGINE,
+        """
       INSERT INTO cons_unit_mappings(user_id, from_cons_unit, to_cons_unit, note, created_at)
       VALUES(:u,:f,:t,:n,:c)
-    """, {"u": user_id, "f": from_cu, "t": to_cu, "n": note, "c": datetime.utcnow().isoformat()})
-
+    """,
+        {"u": user_id, "f": from_cu, "t": to_cu, "n": note, "c": datetime.utcnow().isoformat()},
+    )
 
 # ---------- Runs persistence ----------
 def df_to_json(df: pd.DataFrame) -> str:
@@ -172,36 +185,55 @@ def json_to_df(s: str) -> pd.DataFrame:
     return pd.DataFrame(json.loads(s)) if s else pd.DataFrame()
 
 def save_run(user_id: int, filename: str, reporting_date: str, tables: dict, issues_df: pd.DataFrame, risk_score: float, master_units: int):
-    exec_sql(ENGINE, """
+    exec_sql(
+        ENGINE,
+        """
       INSERT INTO runs(user_id, created_at, reporting_date, filename, master_units, issues_count, risk_score)
       VALUES(:u,:t,:r,:f,:m,:i,:s)
-    """, {"u": user_id, "t": datetime.utcnow().isoformat(), "r": reporting_date or None, "f": filename, "m": master_units, "i": int(len(issues_df)), "s": float(risk_score)})
+    """,
+        {
+            "u": user_id,
+            "t": datetime.utcnow().isoformat(),
+            "r": reporting_date or None,
+            "f": filename,
+            "m": master_units,
+            "i": int(len(issues_df)),
+            "s": float(risk_score),
+        },
+    )
 
     run_row = fetch_one(ENGINE, "SELECT id FROM runs WHERE user_id=:u ORDER BY id DESC LIMIT 1", {"u": user_id})
     run_id = run_row["id"]
 
     for name, df in tables.items():
-        exec_sql(ENGINE, "INSERT INTO run_tables(run_id, table_name, data_json) VALUES(:r,:n,:j)",
-                 {"r": run_id, "n": name, "j": df_to_json(df)})
+        exec_sql(
+            ENGINE,
+            "INSERT INTO run_tables(run_id, table_name, data_json) VALUES(:r,:n,:j)",
+            {"r": run_id, "n": name, "j": df_to_json(df)},
+        )
 
     # store issues with workflow fields
     for _, r in issues_df.iterrows():
-        exec_sql(ENGINE, """
+        exec_sql(
+            ENGINE,
+            """
           INSERT INTO run_issues(run_id,severity,rule_id,title,cons_unit,dataset,record_id,country,details,suggested_action,status,owner,created_at)
           VALUES(:run,:sev,:rid,:title,:cu,:ds,:rec,:cty,:det,:act,'OPEN',NULL,:t)
-        """, {
-            "run": run_id,
-            "sev": r.get("severity",""),
-            "rid": r.get("rule_id",""),
-            "title": r.get("title",""),
-            "cu": r.get("cons_unit",""),
-            "ds": r.get("dataset",""),
-            "rec": r.get("record_id",""),
-            "cty": r.get("country",""),
-            "det": r.get("details",""),
-            "act": r.get("suggested_action",""),
-            "t": datetime.utcnow().isoformat()
-        })
+        """,
+            {
+                "run": run_id,
+                "sev": r.get("severity", ""),
+                "rid": r.get("rule_id", ""),
+                "title": r.get("title", ""),
+                "cu": r.get("cons_unit", ""),
+                "ds": r.get("dataset", ""),
+                "rec": r.get("record_id", ""),
+                "cty": r.get("country", ""),
+                "det": r.get("details", ""),
+                "act": r.get("suggested_action", ""),
+                "t": datetime.utcnow().isoformat(),
+            },
+        )
 
     return run_id
 
@@ -209,7 +241,11 @@ def list_runs(user_id: int):
     return fetch_all(ENGINE, "SELECT * FROM runs WHERE user_id=:u ORDER BY id DESC", {"u": user_id})
 
 def load_run_table(run_id: int, table_name: str) -> pd.DataFrame:
-    row = fetch_one(ENGINE, "SELECT data_json FROM run_tables WHERE run_id=:r AND table_name=:n", {"r": run_id, "n": table_name})
+    row = fetch_one(
+        ENGINE,
+        "SELECT data_json FROM run_tables WHERE run_id=:r AND table_name=:n",
+        {"r": run_id, "n": table_name},
+    )
     if not row:
         return pd.DataFrame()
     return json_to_df(row["data_json"])
@@ -222,16 +258,20 @@ def update_issue_status(issue_id: int, status: str, owner: str = ""):
     exec_sql(ENGINE, "UPDATE run_issues SET status=:s, owner=:o WHERE id=:i", {"s": status, "o": owner or None, "i": issue_id})
 
 def add_comment(issue_id: int, user_id: int, comment: str):
-    exec_sql(ENGINE, "INSERT INTO issue_comments(issue_id,user_id,comment,created_at) VALUES(:i,:u,:c,:t)",
-             {"i": issue_id, "u": user_id, "c": comment, "t": datetime.utcnow().isoformat()})
+    exec_sql(
+        ENGINE,
+        "INSERT INTO issue_comments(issue_id,user_id,comment,created_at) VALUES(:i,:u,:c,:t)",
+        {"i": issue_id, "u": user_id, "c": comment, "t": datetime.utcnow().isoformat()},
+    )
 
 def load_comments(issue_id: int):
     return fetch_all(ENGINE, "SELECT * FROM issue_comments WHERE issue_id=:i ORDER BY id DESC", {"i": issue_id})
 
-
 # ---------- UI ----------
 st.sidebar.header("Maptrix")
+st.sidebar.caption("build: 2026-02-15 sha256-prehash")  # helps confirm cloud redeploy
 st.sidebar.caption(f"Logged in as {user['email']}")
+
 if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
@@ -329,11 +369,13 @@ elif page == "Run History":
         st.info("No saved runs yet.")
         st.stop()
 
-    run_options = {f"Run #{r['id']} — {r.get('created_at','')[:19]} — risk {float(r.get('risk_score',0)):.1f}": r["id"] for r in runs}
+    run_options = {
+        f"Run #{r['id']} — {str(r.get('created_at',''))[:19]} — risk {float(r.get('risk_score',0)):.1f}": r["id"]
+        for r in runs
+    }
     sel = st.selectbox("Select run", list(run_options.keys()))
     run_id = run_options[sel]
 
-    # View tables
     tabs = st.tabs(["Coverage Matrix", "Issues", "Summary", "Leases", "Employees", "Sites"])
     with tabs[0]:
         st.dataframe(load_run_table(run_id, "coverage_matrix"), use_container_width=True)
@@ -364,7 +406,6 @@ elif page == "Mappings":
     st.title("Mappings (memory)")
     st.caption("Save how unknown cons_unit codes should map to canonical codes. Applied automatically on new uploads.")
 
-    # Show current mappings
     rows = fetch_all(ENGINE, "SELECT * FROM cons_unit_mappings WHERE user_id=:u ORDER BY id DESC", {"u": user_id})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
@@ -396,7 +437,10 @@ elif page == "Issues Workflow":
         st.stop()
 
     st.subheader("Issues list")
-    st.dataframe(issues_df[["id","severity","rule_id","title","cons_unit","dataset","status","owner"]], use_container_width=True)
+    st.dataframe(
+        issues_df[["id", "severity", "rule_id", "title", "cons_unit", "dataset", "status", "owner"]],
+        use_container_width=True,
+    )
 
     st.subheader("Update an issue")
     issue_id = st.number_input("Issue ID", min_value=1, step=1)
@@ -421,6 +465,6 @@ elif page == "Issues Workflow":
     comments = load_comments(int(issue_id))
     if comments:
         for c in comments:
-            st.write(f"- {c.get('created_at','')[:19]}: {c.get('comment','')}")
+            st.write(f"- {str(c.get('created_at',''))[:19]}: {c.get('comment','')}")
     else:
         st.write("No comments yet.")
