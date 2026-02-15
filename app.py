@@ -96,6 +96,7 @@ def get_user_by_email(email: str):
     return fetch_one(ENGINE, "SELECT * FROM users WHERE email=:e", {"e": email})
 
 def create_user(email: str, password: str):
+    password = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
     ph = bcrypt.hash(password)
     exec_sql(ENGINE, "INSERT INTO users(email,password_hash,created_at) VALUES(:e,:p,:t)",
              {"e": email, "p": ph, "t": datetime.utcnow().isoformat()})
@@ -104,6 +105,9 @@ def verify_user(email: str, password: str):
     u = get_user_by_email(email)
     if not u:
         return None
+
+    password = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
+
     if bcrypt.verify(password, u["password_hash"]):
         return u
     return None
