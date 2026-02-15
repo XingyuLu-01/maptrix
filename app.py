@@ -6,12 +6,18 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from passlib.hash import bcrypt
+import bcrypt  # <-- use bcrypt library directly (NOT passlib)
 
 from db import get_engine, exec_sql, fetch_all, fetch_one
 from maptrix_engine import (
-    read_workbook, run_rules, issues_to_frames, compute_coverage, compute_coverage_matrix,
-    compute_risk_score, apply_mappings, diff_runs
+    read_workbook,
+    run_rules,
+    issues_to_frames,
+    compute_coverage,
+    compute_coverage_matrix,
+    compute_risk_score,
+    apply_mappings,
+    diff_runs,
 )
 
 st.set_page_config(page_title="Maptrix", layout="wide")
@@ -20,15 +26,20 @@ ENGINE = get_engine()
 
 # ---------- Bootstrap schema (for SQLite dev; for Postgres you can run schema.sql once) ----------
 def bootstrap_sqlite():
-    exec_sql(ENGINE, """
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
-    """)
-    exec_sql(ENGINE, """
+    """,
+    )
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS runs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -39,16 +50,22 @@ def bootstrap_sqlite():
       issues_count INTEGER NOT NULL DEFAULT 0,
       risk_score REAL NOT NULL DEFAULT 0
     );
-    """)
-    exec_sql(ENGINE, """
+    """,
+    )
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS run_tables (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id INTEGER NOT NULL,
       table_name TEXT NOT NULL,
       data_json TEXT NOT NULL
     );
-    """)
-    exec_sql(ENGINE, """
+    """,
+    )
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS run_issues (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id INTEGER NOT NULL,
@@ -65,8 +82,11 @@ def bootstrap_sqlite():
       owner TEXT NULL,
       created_at TEXT NOT NULL
     );
-    """)
-    exec_sql(ENGINE, """
+    """,
+    )
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS issue_comments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       issue_id INTEGER NOT NULL,
@@ -74,8 +94,11 @@ def bootstrap_sqlite():
       comment TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
-    """)
-    exec_sql(ENGINE, """
+    """,
+    )
+    exec_sql(
+        ENGINE,
+        """
     CREATE TABLE IF NOT EXISTS cons_unit_mappings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -85,36 +108,45 @@ def bootstrap_sqlite():
       created_at TEXT NOT NULL,
       UNIQUE(user_id, from_cons_unit)
     );
-    """)
+    """,
+    )
+
 
 bootstrap_sqlite()
 
-# ---------- Auth (FIXED) ----------
+# ---------- Auth (bcrypt library + sha256 prehash; avoids 72-byte issues) ----------
 def get_user_by_email(email: str):
     return fetch_one(ENGINE, "SELECT * FROM users WHERE email=:e", {"e": email})
 
-def _pw_for_bcrypt(password: str) -> str:
+
+def _pw_bytes(password: str) -> bytes:
     """
-    bcrypt has a 72-byte input limit. To avoid errors + unicode issues,
-    we pre-hash with sha256 (always 64 hex chars), then bcrypt that.
+    bcrypt has a 72-byte input limit. We avoid all issues by:
+      password -> sha256 hex (64 chars) -> bytes -> bcrypt
     """
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hashlib.sha256(password.encode("utf-8")).hexdigest().encode("utf-8")
+
 
 def create_user(email: str, password: str):
-    ph = bcrypt.hash(_pw_for_bcrypt(password))
+    pw = _pw_bytes(password)
+    hashed = bcrypt.hashpw(pw, bcrypt.gensalt()).decode("utf-8")
     exec_sql(
         ENGINE,
         "INSERT INTO users(email,password_hash,created_at) VALUES(:e,:p,:t)",
-        {"e": email, "p": ph, "t": datetime.utcnow().isoformat()},
+        {"e": email, "p": hashed, "t": datetime.utcnow().isoformat()},
     )
+
 
 def verify_user(email: str, password: str):
     u = get_user_by_email(email)
     if not u:
         return None
-    if bcrypt.verify(_pw_for_bcrypt(password), u["password_hash"]):
+    pw = _pw_bytes(password)
+    stored = str(u["password_hash"]).encode("utf-8")
+    if bcrypt.checkpw(pw, stored):
         return u
     return None
+
 
 def require_login():
     if "user" not in st.session_state:
@@ -150,6 +182,7 @@ def require_login():
 
     st.stop()
 
+
 user = require_login()
 user_id = user["id"]
 
@@ -161,6 +194,7 @@ def load_mappings(user_id: int) -> dict:
         {"u": user_id},
     )
     return {r["from_cons_unit"]: r["to_cons_unit"] for r in rows}
+
 
 def upsert_mapping(user_id: int, from_cu: str, to_cu: str, note: str = ""):
     exec_sql(
@@ -177,14 +211,25 @@ def upsert_mapping(user_id: int, from_cu: str, to_cu: str, note: str = ""):
         {"u": user_id, "f": from_cu, "t": to_cu, "n": note, "c": datetime.utcnow().isoformat()},
     )
 
+
 # ---------- Runs persistence ----------
 def df_to_json(df: pd.DataFrame) -> str:
     return df.to_json(orient="records")
 
+
 def json_to_df(s: str) -> pd.DataFrame:
     return pd.DataFrame(json.loads(s)) if s else pd.DataFrame()
 
-def save_run(user_id: int, filename: str, reporting_date: str, tables: dict, issues_df: pd.DataFrame, risk_score: float, master_units: int):
+
+def save_run(
+    user_id: int,
+    filename: str,
+    reporting_date: str,
+    tables: dict,
+    issues_df: pd.DataFrame,
+    risk_score: float,
+    master_units: int,
+):
     exec_sql(
         ENGINE,
         """
@@ -212,7 +257,6 @@ def save_run(user_id: int, filename: str, reporting_date: str, tables: dict, iss
             {"r": run_id, "n": name, "j": df_to_json(df)},
         )
 
-    # store issues with workflow fields
     for _, r in issues_df.iterrows():
         exec_sql(
             ENGINE,
@@ -237,8 +281,10 @@ def save_run(user_id: int, filename: str, reporting_date: str, tables: dict, iss
 
     return run_id
 
+
 def list_runs(user_id: int):
     return fetch_all(ENGINE, "SELECT * FROM runs WHERE user_id=:u ORDER BY id DESC", {"u": user_id})
+
 
 def load_run_table(run_id: int, table_name: str) -> pd.DataFrame:
     row = fetch_one(
@@ -250,12 +296,19 @@ def load_run_table(run_id: int, table_name: str) -> pd.DataFrame:
         return pd.DataFrame()
     return json_to_df(row["data_json"])
 
+
 def load_run_issues(run_id: int) -> pd.DataFrame:
     rows = fetch_all(ENGINE, "SELECT * FROM run_issues WHERE run_id=:r ORDER BY id DESC", {"r": run_id})
     return pd.DataFrame(rows)
 
+
 def update_issue_status(issue_id: int, status: str, owner: str = ""):
-    exec_sql(ENGINE, "UPDATE run_issues SET status=:s, owner=:o WHERE id=:i", {"s": status, "o": owner or None, "i": issue_id})
+    exec_sql(
+        ENGINE,
+        "UPDATE run_issues SET status=:s, owner=:o WHERE id=:i",
+        {"s": status, "o": owner or None, "i": issue_id},
+    )
+
 
 def add_comment(issue_id: int, user_id: int, comment: str):
     exec_sql(
@@ -264,12 +317,14 @@ def add_comment(issue_id: int, user_id: int, comment: str):
         {"i": issue_id, "u": user_id, "c": comment, "t": datetime.utcnow().isoformat()},
     )
 
+
 def load_comments(issue_id: int):
     return fetch_all(ENGINE, "SELECT * FROM issue_comments WHERE issue_id=:i ORDER BY id DESC", {"i": issue_id})
 
+
 # ---------- UI ----------
 st.sidebar.header("Maptrix")
-st.sidebar.caption("build: 2026-02-15 sha256-prehash")  # helps confirm cloud redeploy
+st.sidebar.caption("build: 2026-02-15 bcrypt-lib")  # confirm redeploy
 st.sidebar.caption(f"Logged in as {user['email']}")
 
 if st.sidebar.button("Logout"):
@@ -297,7 +352,6 @@ if page == "Upload & Analyze":
     try:
         cu, leases, emp, sites = read_workbook(tmp_path)
 
-        # Apply mapping memory BEFORE checks
         leases = apply_mappings(leases, mappings)
         emp = apply_mappings(emp, mappings)
         sites = apply_mappings(sites, mappings)
@@ -361,7 +415,6 @@ if page == "Upload & Analyze":
         except Exception:
             pass
 
-
 elif page == "Run History":
     st.title("Run History")
     runs = list_runs(user_id)
@@ -401,10 +454,9 @@ elif page == "Run History":
     else:
         st.info("Need at least 2 runs to compare.")
 
-
 elif page == "Mappings":
     st.title("Mappings (memory)")
-    st.caption("Save how unknown cons_unit codes should map to canonical codes. Applied automatically on new uploads.")
+    st.caption("Map unknown cons_unit codes to canonical codes. Applied automatically on upload.")
 
     rows = fetch_all(ENGINE, "SELECT * FROM cons_unit_mappings WHERE user_id=:u ORDER BY id DESC", {"u": user_id})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
@@ -420,7 +472,6 @@ elif page == "Mappings":
             upsert_mapping(user_id, from_cu.strip(), to_cu.strip(), note.strip())
             st.success("Saved mapping.")
             st.rerun()
-
 
 elif page == "Issues Workflow":
     st.title("Issues Workflow")
