@@ -1,32 +1,23 @@
+# maptrix_engine.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 
 
-@dataclass
-class Issue:
-    severity: str          # HIGH/MEDIUM/LOW
-    rule_id: str
-    title: str
-    cons_unit: str
-    dataset: str
-    record_id: str
-    country: str
-    details: str
-    suggested_action: str
+# =========================
+# Utilities
+# =========================
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
 
-def safe_str(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def coerce_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series.replace("", pd.NA), errors="coerce")
+def _as_str_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).fillna("").str.strip()
 
 
 def ensure_cols(df: pd.DataFrame, required: List[str], name: str) -> None:
@@ -35,267 +26,485 @@ def ensure_cols(df: pd.DataFrame, required: List[str], name: str) -> None:
         raise ValueError(f"{name} missing columns: {missing}. Available: {list(df.columns)}")
 
 
-def read_workbook(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    xls = pd.ExcelFile(path)
-
-    def rs(sheet: str, required: bool) -> pd.DataFrame:
-        if sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet)
-            df.columns = [safe_str(c) for c in df.columns]
-            for c in df.columns:
-                if df[c].dtype == object:
-                    df[c] = df[c].map(safe_str)
-            return df
-        return pd.DataFrame() if not required else (_raise_missing(sheet, xls.sheet_names))
-
-    cu = rs("consolidation_units", True)
-    leases = rs("leases", False)
-    emp = rs("employees", False)
-    sites = rs("production_sites", False)
-    return cu, leases, emp, sites
-
-
-def _raise_missing(sheet: str, names) -> pd.DataFrame:
-    raise ValueError(f"Missing required sheet '{sheet}'. Found: {names}")
-
-
-def normalize_cons_unit(df: pd.DataFrame) -> pd.Series:
-    if df is None or df.empty or "cons_unit" not in df.columns:
-        return pd.Series([], dtype=str)
-    return df["cons_unit"].astype(str).str.strip()
-
-
-def apply_mappings(df: pd.DataFrame, mappings: Dict[str, str]) -> pd.DataFrame:
-    """
-    Apply from_cons_unit -> to_cons_unit mapping on any df that contains cons_unit.
-    """
-    if df is None or df.empty or "cons_unit" not in df.columns or not mappings:
-        return df
+def _ensure_numeric(df: pd.DataFrame, cols: List[str], default: float = 0.0) -> pd.DataFrame:
     out = df.copy()
-    out["cons_unit"] = out["cons_unit"].astype(str).str.strip().map(lambda x: mappings.get(x, x))
+    for c in cols:
+        if c not in out.columns:
+            out[c] = default
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(default)
     return out
 
 
-def compute_coverage(master: pd.DataFrame, df: pd.DataFrame) -> Dict[str, object]:
-    m = set(normalize_cons_unit(master))
-    d = set(normalize_cons_unit(df))
-    return {
-        "master_total": len(m),
-        "dataset_total": len(d),
-        "matched": len(m & d),
-        "unknown": len(d - m),
-        "missing": len(m - d),
-        "unknown_set": sorted(d - m),
-        "missing_set": sorted(m - d),
-    }
+def _norm_cons_unit(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "cons_unit" in out.columns:
+        out["cons_unit"] = _as_str_series(out["cons_unit"])
+    return out
 
 
-def compute_coverage_matrix(cu: pd.DataFrame, leases: pd.DataFrame, emp: pd.DataFrame, sites: pd.DataFrame) -> pd.DataFrame:
-    master = sorted(set(normalize_cons_unit(cu)))
-    leases_set = set(normalize_cons_unit(leases))
-    emp_set = set(normalize_cons_unit(emp))
-    sites_set = set(normalize_cons_unit(sites))
-
-    rows = []
-    for unit in master:
-        rows.append({
-            "cons_unit": unit,
-            "in_leases": unit in leases_set,
-            "in_employees": unit in emp_set,
-            "in_sites": unit in sites_set,
-        })
-    return pd.DataFrame(rows)
+def _norm_country(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "country" in out.columns:
+        out["country"] = _as_str_series(out["country"])
+    return out
 
 
-def run_rules(cu: pd.DataFrame, leases: pd.DataFrame, emp: pd.DataFrame, sites: pd.DataFrame) -> List[Issue]:
+def apply_mappings(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    Apply cons_unit mapping memory: replace df['cons_unit'] values if in mapping dict.
+    mapping: {from_cons_unit: to_cons_unit}
+    """
+    if df is None or df.empty or "cons_unit" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    out["cons_unit"] = _as_str_series(out["cons_unit"]).map(lambda x: mapping.get(x, x))
+    return out
+
+
+# =========================
+# Issues model
+# =========================
+@dataclass
+class Issue:
+    severity: str               # "HIGH" | "MEDIUM" | "LOW"
+    rule_id: str                # e.g. "CU_001"
+    title: str                  # short
+    cons_unit: str              # canonical cons_unit
+    dataset: str                # consolidation_units | leases | employees | production_sites
+    record_id: str              # identifier (string)
+    country: str                # best-known
+    details: str                # explanation
+    suggested_action: str       # what to do
+
+
+def _issue(
+    severity: str,
+    rule_id: str,
+    title: str,
+    cons_unit: str,
+    dataset: str,
+    record_id: str = "",
+    country: str = "",
+    details: str = "",
+    suggested_action: str = "",
+) -> Issue:
+    return Issue(
+        severity=severity,
+        rule_id=rule_id,
+        title=title,
+        cons_unit=str(cons_unit or "").strip(),
+        dataset=dataset,
+        record_id=str(record_id or "").strip(),
+        country=str(country or "").strip(),
+        details=details,
+        suggested_action=suggested_action,
+    )
+
+
+# =========================
+# Normalization per dataset (engine-side safety net)
+# =========================
+def normalize_consolidation_units(cu: pd.DataFrame) -> pd.DataFrame:
+    cu = _clean_cols(cu)
+    ensure_cols(cu, ["cons_unit", "country", "company_name"], "consolidation_units")
+    cu = _norm_cons_unit(_norm_country(cu))
+
+    # optional cons_unit_name
+    if "cons_unit_name" not in cu.columns:
+        cu = cu.copy()
+        cu["cons_unit_name"] = cu["company_name"]
+
+    return cu
+
+
+def normalize_leases(leases: pd.DataFrame) -> pd.DataFrame:
+    if leases is None or leases.empty:
+        return pd.DataFrame(columns=["cons_unit", "country", "company_code", "contract_name", "start_date", "end_date", "facility_type"])
+
+    leases = _clean_cols(leases)
+    ensure_cols(leases, ["cons_unit"], "leases")
+    leases = _norm_cons_unit(_norm_country(leases))
+
+    # create optional columns if missing
+    for c in ["country", "company_code", "contract_name", "start_date", "end_date", "facility_type"]:
+        if c not in leases.columns:
+            leases[c] = ""
+
+    # dates as strings (safe)
+    for c in ["start_date", "end_date"]:
+        leases[c] = leases[c].astype(str).fillna("").str.strip()
+
+    return leases
+
+
+def normalize_employees(emp: pd.DataFrame) -> pd.DataFrame:
+    if emp is None or emp.empty:
+        return pd.DataFrame(columns=[
+            "cons_unit", "cons_unit_name",
+            "admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"
+        ])
+
+    emp = _clean_cols(emp)
+    ensure_cols(emp, ["cons_unit"], "employees")
+    emp = _norm_cons_unit(emp)
+
+    emp = emp.copy()
+
+    # Optional name columns
+    if "cons_unit_name" not in emp.columns:
+        if "unit_name" in emp.columns:
+            emp["cons_unit_name"] = emp["unit_name"]
+        else:
+            emp["cons_unit_name"] = ""
+
+    # Accept rd_FTEs alias
+    if "r_and_d_FTEs" not in emp.columns and "rd_FTEs" in emp.columns:
+        emp["r_and_d_FTEs"] = emp["rd_FTEs"]
+
+    # Ensure numeric fields (missing => 0)
+    emp = _ensure_numeric(emp, [
+        "admin_FTEs",
+        "service_production_FTEs",
+        "legal_FTEs",
+        "r_and_d_FTEs",
+        "sales_mkt_FTEs",
+    ], default=0.0)
+
+    return emp
+
+
+def normalize_sites(sites: pd.DataFrame) -> pd.DataFrame:
+    if sites is None or sites.empty:
+        return pd.DataFrame(columns=["cons_unit", "country", "site_name"])
+
+    sites = _clean_cols(sites)
+    ensure_cols(sites, ["cons_unit"], "production_sites")
+    sites = _norm_cons_unit(_norm_country(sites))
+
+    if "site_name" not in sites.columns:
+        # try common alternatives
+        for alt in ["facility_name", "plant_name", "location_name"]:
+            if alt in sites.columns:
+                sites["site_name"] = sites[alt]
+                break
+        if "site_name" not in sites.columns:
+            sites["site_name"] = ""
+
+    if "country" not in sites.columns:
+        sites["country"] = ""
+
+    return sites
+
+
+# =========================
+# Core checks (rules)
+# =========================
+def run_rules(
+    cu: pd.DataFrame,
+    leases: pd.DataFrame,
+    emp: pd.DataFrame,
+    sites: pd.DataFrame
+) -> List[Issue]:
+    """
+    Returns a list[Issue]. It should NEVER crash for optional missing datasets/columns.
+    It will only error if consolidation_units lacks required minimal columns.
+    """
+    cu_n = normalize_consolidation_units(cu)
+    leases_n = normalize_leases(leases)
+    emp_n = normalize_employees(emp)
+    sites_n = normalize_sites(sites)
+
     issues: List[Issue] = []
-    ensure_cols(cu, ["cons_unit", "cons_unit_name", "country", "company_name"], "consolidation_units")
-    cu_set = set(normalize_cons_unit(cu))
 
-    # Employees
-    if not emp.empty:
-# Required minimal columns for employees
-ensure_cols(emp, ["cons_unit"], "employees")
+    cu_set = set(cu_n["cons_unit"].astype(str))
 
-# Normalize optional names / aliases
-emp = emp.copy()
+    # ---------- Rule CU_001: duplicate cons_unit in master ----------
+    dup = cu_n["cons_unit"].astype(str).duplicated(keep=False)
+    if dup.any():
+        dups = cu_n.loc[dup, ["cons_unit", "country", "company_name"]]
+        for _, r in dups.iterrows():
+            issues.append(_issue(
+                severity="HIGH",
+                rule_id="CU_001",
+                title="Duplicate cons_unit in consolidation_units",
+                cons_unit=r.get("cons_unit", ""),
+                dataset="consolidation_units",
+                record_id=r.get("cons_unit", ""),
+                country=r.get("country", ""),
+                details=f"cons_unit '{r.get('cons_unit','')}' appears multiple times in consolidation_units.",
+                suggested_action="Deduplicate consolidation master or clarify consolidation mapping."
+            ))
 
-# cons_unit_name optional: derive if missing
-if "cons_unit_name" not in emp.columns:
-    if "unit_name" in emp.columns:
-        emp["cons_unit_name"] = emp["unit_name"]
-    else:
-        emp["cons_unit_name"] = ""
+    # ---------- Rule DS_001: dataset cons_unit not in master ----------
+    def _missing_in_master(df: pd.DataFrame, dataset_name: str, id_col: str = ""):
+        if df is None or df.empty or "cons_unit" not in df.columns:
+            return
+        unknown = sorted(set(df["cons_unit"].astype(str)) - cu_set)
+        for u in unknown:
+            issues.append(_issue(
+                severity="HIGH",
+                rule_id="DS_001",
+                title="cons_unit not found in consolidation_units",
+                cons_unit=u,
+                dataset=dataset_name,
+                record_id=u,
+                country="",
+                details=f"'{u}' appears in {dataset_name} but not in consolidation_units.",
+                suggested_action="Fix upstream extract or add missing consolidation unit to master."
+            ))
 
-# R&D column: accept either rd_FTEs or r_and_d_FTEs
-if "r_and_d_FTEs" not in emp.columns and "rd_FTEs" in emp.columns:
-    emp["r_and_d_FTEs"] = emp["rd_FTEs"]
+    _missing_in_master(leases_n, "leases")
+    _missing_in_master(emp_n, "employees")
+    _missing_in_master(sites_n, "production_sites")
 
-# If still missing, create as 0
-for col in ["admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"]:
-    if col not in emp.columns:
-        emp[col] = 0
+    # ---------- Rule COV_001: master cons_unit with no signals anywhere ----------
+    # "Signals" means appears in any dataset. Holding entities may legitimately have none,
+    # so severity is MEDIUM (review) rather than HIGH.
+    signals = set()
+    for df in [leases_n, emp_n, sites_n]:
+        if df is not None and not df.empty and "cons_unit" in df.columns:
+            signals |= set(df["cons_unit"].astype(str))
+
+    for cu_code in sorted(cu_set):
+        if cu_code not in signals:
+            country = cu_n.loc[cu_n["cons_unit"].astype(str) == cu_code, "country"]
+            company = cu_n.loc[cu_n["cons_unit"].astype(str) == cu_code, "company_name"]
+            issues.append(_issue(
+                severity="MEDIUM",
+                rule_id="COV_001",
+                title="No operational signals for cons_unit",
+                cons_unit=cu_code,
+                dataset="consolidation_units",
+                record_id=cu_code,
+                country=str(country.iloc[0]) if len(country) else "",
+                details=f"'{cu_code}' has no matching records in leases/employees/sites. Could be holding/dormant entity or missing data.",
+                suggested_action="Confirm if holding/dormant; otherwise investigate missing extracts."
+            ))
+
+    # ---------- Rule EMP_001: employees record exists but all FTEs = 0 ----------
+    if emp_n is not None and not emp_n.empty:
         fte_cols = ["admin_FTEs", "service_production_FTEs", "legal_FTEs", "r_and_d_FTEs", "sales_mkt_FTEs"]
-        for c in fte_cols:
-            emp[c] = pd.to_numeric(emp[c], errors="coerce").fillna(0)
-        emp["total_FTEs"] = emp[fte_cols].sum(axis=1)
+        emp_n = _ensure_numeric(emp_n, fte_cols, default=0.0)
+        emp_n["fte_total"] = emp_n[fte_cols].sum(axis=1)
 
-        unknown = emp.loc[~emp["cons_unit"].isin(cu_set)]
-        for _, r in unknown.iterrows():
-            issues.append(Issue("HIGH", "R101", "Employees record references unknown cons_unit",
-                               r["cons_unit"], "employees", "", "", 
-                               "cons_unit appears in employees but not in consolidation_units master list.",
-                               "Fix cons_unit code OR add missing cons_unit to consolidation_units extract."))
+        zero = emp_n["fte_total"] <= 0
+        for _, r in emp_n.loc[zero].iterrows():
+            issues.append(_issue(
+                severity="LOW",
+                rule_id="EMP_001",
+                title="Employees row with zero total FTE",
+                cons_unit=r.get("cons_unit", ""),
+                dataset="employees",
+                record_id=r.get("cons_unit", ""),
+                country="",
+                details="Employees record exists but total FTE is 0. This can indicate incomplete HR extract.",
+                suggested_action="Confirm HR data extract; remove empty rows or provide correct FTE split."
+            ))
 
-    # Leases
-    if not leases.empty:
-        ensure_cols(leases, ["cons_unit", "country", "company_code", "contract_name", "start_date", "end_date", "facility_type"], "leases")
-        if "lease_id" not in leases.columns:
-            leases["lease_id"] = ""
+    # ---------- Rule LEASE_001: lease missing facility_type ----------
+    if leases_n is not None and not leases_n.empty:
+        missing_type = leases_n["facility_type"].astype(str).fillna("").str.strip().eq("")
+        for idx, r in leases_n.loc[missing_type].iterrows():
+            issues.append(_issue(
+                severity="LOW",
+                rule_id="LEASE_001",
+                title="Lease missing facility type",
+                cons_unit=r.get("cons_unit", ""),
+                dataset="leases",
+                record_id=r.get("contract_name", f"row_{idx}"),
+                country=r.get("country", ""),
+                details="Lease has no facility_type. Facility classification is needed for ESG scoping (office/warehouse/production/etc.).",
+                suggested_action="Add facility_type in lease extract or mapping layer."
+            ))
 
-        leases["start_dt"] = coerce_date(leases["start_date"])
-        leases["end_dt"] = coerce_date(leases["end_date"])
-
-        unknown = leases.loc[~leases["cons_unit"].isin(cu_set)]
-        for _, r in unknown.iterrows():
-            issues.append(Issue("HIGH", "R201", "Lease references unknown cons_unit",
-                               r["cons_unit"], "leases", str(r.get("lease_id","")), str(r.get("country","")),
-                               f"Lease '{r.get('contract_name','')}' uses cons_unit not in consolidation_units.",
-                               "Fix cons_unit code OR ensure consolidation_units extract includes this unit."))
-
-        bad_dates = leases.loc[leases["start_dt"].isna() | leases["end_dt"].isna()]
-        for _, r in bad_dates.iterrows():
-            issues.append(Issue("MEDIUM", "R202", "Lease has missing or invalid start/end date",
-                               str(r.get("cons_unit","")), "leases", str(r.get("lease_id","")), str(r.get("country","")),
-                               f"start_date='{r.get('start_date','')}', end_date='{r.get('end_date','')}'",
-                               "Correct lease start/end dates to enable quarter-based checks."))
-
-        inverted = leases.loc[leases["start_dt"].notna() & leases["end_dt"].notna() & (leases["end_dt"] < leases["start_dt"])]
-        for _, r in inverted.iterrows():
-            issues.append(Issue("HIGH", "R203", "Lease end_date is earlier than start_date",
-                               str(r.get("cons_unit","")), "leases", str(r.get("lease_id","")), str(r.get("country","")),
-                               f"Lease '{r.get('contract_name','')}' has end_date < start_date.",
-                               "Fix inverted lease dates."))
-
-        missing_ft = leases.loc[leases["facility_type"].astype(str).str.strip() == ""]
-        for _, r in missing_ft.iterrows():
-            issues.append(Issue("LOW", "R204", "Lease missing facility_type",
-                               str(r.get("cons_unit","")), "leases", str(r.get("lease_id","")), str(r.get("country","")),
-                               f"Lease '{r.get('contract_name','')}' has blank facility_type.",
-                               "Fill facility_type to support footprint classification."))
-
-    # Sites
-    if not sites.empty:
-        ensure_cols(sites, ["cons_unit", "country", "site_name"], "production_sites")
-        if "site_id" not in sites.columns:
-            sites["site_id"] = ""
-
-        unknown = sites.loc[~sites["cons_unit"].isin(cu_set)]
-        for _, r in unknown.iterrows():
-            issues.append(Issue("HIGH", "R301", "Production site references unknown cons_unit",
-                               r["cons_unit"], "production_sites", str(r.get("site_id","")), str(r.get("country","")),
-                               f"Site '{r.get('site_name','')}' uses cons_unit not in consolidation_units.",
-                               "Fix cons_unit mapping OR add missing cons_unit to consolidation_units."))
-
-    # Cross checks
-    leases_set = set(normalize_cons_unit(leases))
-    sites_set = set(normalize_cons_unit(sites))
-
-    if not emp.empty:
-        emp_tot = emp.groupby("cons_unit", as_index=True)["total_FTEs"].sum()
-        for unit in sorted(set(normalize_cons_unit(emp)) & cu_set):
-            if float(emp_tot.get(unit, 0)) > 0 and unit not in leases_set:
-                issues.append(Issue("MEDIUM", "R401", "Employees exist but no leases for cons_unit",
-                                   unit, "cross", "", "",
-                                   f"total_FTEs={float(emp_tot.get(unit,0)):.0f} but no leases found.",
-                                   "Lease extract may be incomplete, or facilities are owned; document boundary logic."))
-
-        if not leases.empty:
-            for unit in sorted(leases_set & cu_set):
-                if float(emp_tot.get(unit, 0)) == 0:
-                    issues.append(Issue("LOW", "R402", "Leases exist but employees are zero for cons_unit",
-                                       unit, "cross", "", "",
-                                       "Lease footprint exists but HR shows 0 FTEs.",
-                                       "Confirm outsourcing/shared services or missing HR data."))
-
-    if not sites.empty:
-        for unit in sorted(sites_set & cu_set):
-            if unit not in leases_set:
-                issues.append(Issue("MEDIUM", "R403", "Production sites exist but no leases for cons_unit",
-                                   unit, "cross", "", "",
-                                   "Site list shows locations but lease register has none.",
-                                   "Check owned-vs-leased or missing lease extraction."))
+    # ---------- Rule SITE_001: production site missing site_name ----------
+    if sites_n is not None and not sites_n.empty:
+        missing_name = sites_n["site_name"].astype(str).fillna("").str.strip().eq("")
+        for idx, r in sites_n.loc[missing_name].iterrows():
+            issues.append(_issue(
+                severity="LOW",
+                rule_id="SITE_001",
+                title="Production site missing site name",
+                cons_unit=r.get("cons_unit", ""),
+                dataset="production_sites",
+                record_id=f"row_{idx}",
+                country=r.get("country", ""),
+                details="Site record has no site_name; this reduces auditability and completeness checks.",
+                suggested_action="Provide site_name/facility_name in the source extract."
+            ))
 
     return issues
 
 
+# =========================
+# Outputs for UI
+# =========================
 def issues_to_frames(issues: List[Issue]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.DataFrame([i.__dict__ for i in issues])
-    if df.empty:
-        summary = pd.DataFrame(columns=["severity", "rule_id", "title", "count"])
-    else:
-        summary = (df.groupby(["severity", "rule_id", "title"], as_index=False)
-                     .size()
-                     .rename(columns={"size": "count"})
-                     .sort_values(["severity", "count"], ascending=[True, False]))
-    return df, summary
-
-
-def compute_risk_score(issues_df: pd.DataFrame, coverage: Dict[str, Dict[str, object]]) -> float:
     """
-    Simple, explainable risk score 0-100 based on:
-      - HIGH issues
-      - MEDIUM issues
-      - unknown cons_units in datasets
-      - missing coverage
+    Returns:
+      issues_df: normalized issue table
+      summary_df: aggregated counts by severity and dataset
+    """
+    if not issues:
+        issues_df = pd.DataFrame(columns=[
+            "severity", "rule_id", "title", "cons_unit", "dataset", "record_id", "country", "details", "suggested_action"
+        ])
+        summary_df = pd.DataFrame(columns=["severity", "dataset", "count"])
+        return issues_df, summary_df
+
+    issues_df = pd.DataFrame([asdict(i) for i in issues])
+
+    summary_df = (
+        issues_df.groupby(["severity", "dataset"], dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values(["severity", "dataset"])
+    )
+
+    return issues_df, summary_df
+
+
+def compute_coverage(cu: pd.DataFrame, df: pd.DataFrame) -> Dict[str, int]:
+    """
+    Coverage computed by cons_unit matching.
+    Returns: {master_total, matched, unknown}
+    """
+    cu_n = normalize_consolidation_units(cu)
+    master = set(cu_n["cons_unit"].astype(str))
+
+    if df is None or df.empty or "cons_unit" not in df.columns:
+        return {"master_total": len(master), "matched": 0, "unknown": 0}
+
+    df = _norm_cons_unit(_clean_cols(df))
+    units = set(df["cons_unit"].astype(str))
+    matched = len(units & master)
+    unknown = len(units - master)
+
+    return {"master_total": len(master), "matched": matched, "unknown": unknown}
+
+
+def compute_coverage_matrix(cu: pd.DataFrame, leases: pd.DataFrame, emp: pd.DataFrame, sites: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per master cons_unit, columns indicate whether a dataset has at least one record.
+    """
+    cu_n = normalize_consolidation_units(cu)
+    leases_n = normalize_leases(leases)
+    emp_n = normalize_employees(emp)
+    sites_n = normalize_sites(sites)
+
+    master = sorted(set(cu_n["cons_unit"].astype(str)))
+
+    def has(df: pd.DataFrame) -> set:
+        if df is None or df.empty or "cons_unit" not in df.columns:
+            return set()
+        return set(df["cons_unit"].astype(str))
+
+    s_leases = has(leases_n)
+    s_emp = has(emp_n)
+    s_sites = has(sites_n)
+
+    out = pd.DataFrame({
+        "cons_unit": master,
+        "in_leases": [cu in s_leases for cu in master],
+        "in_employees": [cu in s_emp for cu in master],
+        "in_sites": [cu in s_sites for cu in master],
+    })
+
+    # Add company + country for convenience
+    meta = cu_n[["cons_unit", "country", "company_name"]].copy()
+    meta["cons_unit"] = meta["cons_unit"].astype(str)
+    out = out.merge(meta, on="cons_unit", how="left")
+
+    # coverage score
+    out["datasets_present"] = out[["in_leases", "in_employees", "in_sites"]].sum(axis=1)
+    return out
+
+
+def compute_risk_score(issues_df: pd.DataFrame, coverage: Dict[str, Dict[str, int]]) -> float:
+    """
+    Simple heuristic:
+    - Issues severity weights: HIGH=10, MEDIUM=5, LOW=1
+    - Coverage penalty: missing matches reduce score
+    Output 0..100 (higher = worse)
     """
     if issues_df is None or issues_df.empty:
-        base = 0.0
+        issue_points = 0.0
     else:
-        hi = int((issues_df["severity"] == "HIGH").sum())
-        med = int((issues_df["severity"] == "MEDIUM").sum())
-        low = int((issues_df["severity"] == "LOW").sum())
-        base = hi * 10 + med * 4 + low * 1
+        sev = issues_df["severity"].astype(str).str.upper()
+        issue_points = (
+            (sev == "HIGH").sum() * 10.0 +
+            (sev == "MEDIUM").sum() * 5.0 +
+            (sev == "LOW").sum() * 1.0
+        )
 
-    unknown = 0
-    missing = 0
-    for cov in coverage.values():
-        unknown += int(cov.get("unknown", 0))
-        missing += int(cov.get("missing", 0))
+    # Coverage penalty based on matched ratio
+    cov_points = 0.0
+    for k, v in (coverage or {}).items():
+        master_total = max(int(v.get("master_total", 0)), 1)
+        matched = int(v.get("matched", 0))
+        ratio = matched / master_total
+        # missing coverage adds points
+        cov_points += (1.0 - ratio) * 10.0
 
-    score = base + unknown * 6 + missing * 2
-    return float(min(100.0, score))
+    score = issue_points + cov_points
+
+    # normalize to 0..100 with a soft cap
+    score = min(100.0, float(score))
+    return score
 
 
-def diff_runs(prev_cov_matrix: pd.DataFrame, curr_cov_matrix: pd.DataFrame) -> pd.DataFrame:
+def diff_runs(prev_matrix: pd.DataFrame, curr_matrix: pd.DataFrame) -> pd.DataFrame:
     """
-    Compare coverage matrix between runs.
-    Outputs changes in in_leases/in_employees/in_sites per cons_unit.
+    Compare two coverage_matrix tables (from compute_coverage_matrix).
+    Returns rows where any dataset flags changed.
     """
-    if prev_cov_matrix is None or prev_cov_matrix.empty:
-        out = curr_cov_matrix.copy()
-        out["change"] = "NEW_RUN_BASELINE"
-        return out
+    if prev_matrix is None or prev_matrix.empty:
+        return pd.DataFrame(columns=["cons_unit", "field", "prev", "curr"])
+    if curr_matrix is None or curr_matrix.empty:
+        return pd.DataFrame(columns=["cons_unit", "field", "prev", "curr"])
 
-    prev = prev_cov_matrix.set_index("cons_unit")
-    curr = curr_cov_matrix.set_index("cons_unit")
+    prev = prev_matrix.copy()
+    curr = curr_matrix.copy()
 
-    all_units = sorted(set(prev.index) | set(curr.index))
-    rows = []
+    # ensure required columns exist
+    for df in [prev, curr]:
+        if "cons_unit" not in df.columns:
+            raise ValueError("coverage_matrix must include cons_unit")
 
-    for u in all_units:
-        p = prev.loc[u] if u in prev.index else None
-        c = curr.loc[u] if u in curr.index else None
+    prev["cons_unit"] = prev["cons_unit"].astype(str)
+    curr["cons_unit"] = curr["cons_unit"].astype(str)
 
-        if p is None:
-            rows.append({"cons_unit": u, "change": "ADDED", "in_leases": c["in_leases"], "in_employees": c["in_employees"], "in_sites": c["in_sites"]})
-            continue
-        if c is None:
-            rows.append({"cons_unit": u, "change": "REMOVED", "in_leases": p["in_leases"], "in_employees": p["in_employees"], "in_sites": p["in_sites"]})
-            continue
+    keys = ["cons_unit"]
+    fields = [c for c in ["in_leases", "in_employees", "in_sites", "datasets_present"] if c in prev.columns and c in curr.columns]
 
-        changed = (bool(p["in_leases"]) != bool(c["in_leases"]) or bool(p["in_employees"]) != bool(c["in_employees"]) or bool(p["in_sites"]) != bool(c["in_sites"]))
-        if changed:
-            rows.append({"cons_unit": u, "change": "CHANGED", "in_leases": c["in_leases"], "in_employees": c["in_employees"], "in_sites": c["in_sites"]})
+    merged = prev[keys + fields].merge(curr[keys + fields], on="cons_unit", how="outer", suffixes=("_prev", "_curr")).fillna(False)
 
-    return pd.DataFrame(rows)
+    changes = []
+    for _, r in merged.iterrows():
+        cu = r["cons_unit"]
+        for f in fields:
+            pv = r.get(f + "_prev", False)
+            cv = r.get(f + "_curr", False)
+            if pv != cv:
+                changes.append({"cons_unit": cu, "field": f, "prev": pv, "curr": cv})
+
+    return pd.DataFrame(changes)
+
+
+# Optional: if other parts of your app still call these
+def read_workbook(path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Legacy helper: reads sheets with standard names if present.
+    Your new app uses its own raw reader + mapping UI, so this is here for backward compatibility.
+    """
+    xls = pd.ExcelFile(path)
+    def rs(name: str) -> pd.DataFrame:
+        if name in xls.sheet_names:
+            return pd.read_excel(xls, sheet_name=name)
+        return pd.DataFrame()
+
+    cu = rs("consolidation_units")
+    leases = rs("leases")
+    emp = rs("employees")
+    sites = rs("production_sites")
+    return cu, leases, emp, sites
